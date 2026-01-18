@@ -1,0 +1,26 @@
+{
+  "watch_dir": "C:/Path/To/Folder/You/Want/To/Sort",
+  "log_path": "C:/Path/To/Logs/sorter_proposals.jsonl",
+
+  "auto_threshold": 0.45,
+  "margin_threshold": 0.05,
+
+  "folder_to_prototypes": {
+    "Finance": [
+      "invoice receipt payment statement bank tax",
+      "credit card bill transaction"
+    ],
+    "School": [
+      "assignment lecture tutorial notes",
+      "lab report project"
+    ],
+    "Personal": [
+      "selfie photo family travel",
+      "passport flight itinerary"
+    ],
+    "Games": [
+      "video game character",
+      "game screenshot gameplay"
+    ]
+  }
+}

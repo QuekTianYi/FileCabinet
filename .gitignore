@@ -1,0 +1,67 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# =========================
+# ML / Model Artifacts
+# =========================
+# Hugging Face / sentence-transformers cache
+.cache/
+**/.cache/
+**/huggingface/
+
+# Torch cache
+**/torch_extensions/
+
+# Saved models / embeddings
+models/
+embeddings/
+*.npy
+*.npz
+*.pt
+*.pth
+
+# =========================
+# Logs & Outputs
+# =========================
+logs/
+*.log
+*.jsonl
+
+# =========================
+# User Configuration
+# =========================
+config.json
+config.local.json
+
+# =========================
+# File Cabinet Generated Data
+# =========================
+index/
+catalog/
+state/
+history/
+undo/
+review/
+
+# =========================
+# OS / Editor junk
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# IDEs
+# =========================
+.vscode/
+.idea/
