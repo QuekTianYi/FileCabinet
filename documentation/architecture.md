@@ -1,5 +1,13 @@
 # Architecture
 
+Based on the digital file formats, there should be a first layer of checking.
+
+First Layer: File Format
+Second Layer: Metadata
+Third Layer: Content
+
+There will be a default category pack, which will be customizable to the user's preferences.
+
 ## High-Level Flow
 1. Scan top-level items in WATCH_DIR
 2. Extract semantic text using handlers

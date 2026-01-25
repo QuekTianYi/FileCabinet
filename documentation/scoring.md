@@ -2,6 +2,7 @@
 
 ## Embedding Model
 - sentence-transformers/all-MiniLM-L6-v2
+Using a pretrained embedding model that turns text into vectors.
 
 ## Category Representation
 Each category is represented by a centroid formed from multiple prototype
