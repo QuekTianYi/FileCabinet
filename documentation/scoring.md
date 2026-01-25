@@ -1,5 +1,7 @@
 # Scoring & Similarity
 
+Before any scoring based on the content of the file or folder, there will be a round of scan on the file format and metadata.
+
 ## Embedding Model
 - sentence-transformers/all-MiniLM-L6-v2
 Using a pretrained embedding model that turns text into vectors.
