@@ -11,6 +11,10 @@ from handlers.zip_handler import ZipHandler
 from datetime import datetime, timezone
 import uuid
 
+from pipeline.file_format import FileFormat
+from pipeline.format import detect_file_format
+from pipeline.record import SortRecord
+
 # -----------------------------
 # Globals / setup
 # -----------------------------
@@ -57,6 +61,7 @@ def propose_destination(model, file_text, folder_centroids):
 # -----------------------------
 # Helpers
 # -----------------------------
+
 def is_safe_path(p: Path) -> bool:
     # Skip hidden dirs/files like .git, .venv, etc.
     return not any(part.startswith(".") for part in p.parts)
@@ -171,6 +176,66 @@ def aggregate_zip_text(zip_path: Path) -> tuple[str, list[str]]:
     agg = " | ".join(pieces)
     return agg[:MAX_TOTAL_TEXT_CHARS], sampled
 
+def detect_format_for_path(path: Path):
+    """
+    Always returns a dict with keys:
+    format, mime, confidence, source
+    Never raises even if detector fails.
+    """
+    if path.is_dir():
+        return {
+            "format": "FOLDER",
+            "mime": None,
+            "confidence": 1.0,
+            "source": "container",
+        }
+
+    try:
+        fr = detect_file_format(path)
+    except Exception as e:
+        fr = None
+
+    # If detector returns None (or failed), fall back to extension-based guess
+    if fr is None:
+        ext = path.suffix.lower()
+
+        # super simple fallback buckets (adjust as your enum grows)
+        if ext in {".zip", ".rar", ".7z", ".tar", ".gz"}:
+            fmt = "ARCHIVE"
+        elif ext in {".pdf", ".docx", ".doc", ".pptx", ".xlsx", ".txt", "._toggle"}:
+            fmt = "DOCUMENT"
+        elif ext in {".py", ".js", ".ts", ".java", ".c", ".cpp", ".cs", ".html", ".css", ".json", ".yml", ".yaml"}:
+            fmt = "CODE"
+        elif ext in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            fmt = "IMAGE"
+        elif ext in {".exe", ".msi"}:
+            fmt = "INSTALLER"
+        else:
+            fmt = "UNKNOWN"
+
+        return {
+            "format": fmt,
+            "mime": None,
+            "confidence": 0.3,   # low confidence fallback
+            "source": "extension_fallback",
+        }
+
+    # Normal case (FormatDetector succeeded)
+    return {
+        "format": fr.format.name,
+        "mime": getattr(fr, "mime", None),
+        "confidence": getattr(fr, "confidence", 0.7),
+        "source": getattr(fr, "source", "detector"),
+    }
+
+
+def inject_format_hint(text: str, fmt_name: str) -> str:
+    """
+    Simple but effective: prepend a stable hint so embeddings learn the context.
+    This alone often improves accuracy (e.g., documents stop being mistaken as software).
+    """
+    return f"format: {fmt_name}. {text}"
+
 # -----------------------------
 # Main runner
 # -----------------------------
@@ -222,9 +287,12 @@ def run(
 
         # ---- Folder proposals (TOP-LEVEL only; move whole folder)
         for folder in sorted(top_level_folders):
-            text, sampled = aggregate_folder_text(folder)
-            if not text.strip():
-                text = f"folder_name: {folder.name}"
+            raw_text, sampled = aggregate_folder_text(folder)
+            if not raw_text.strip():
+                raw_text = f"folder_name: {folder.name}"
+
+            fmt = detect_format_for_path(folder)  # FOLDER
+            text = inject_format_hint(raw_text, fmt["format"])
 
             best_folder, best_score, second_score, margin, top5 = propose_destination(
                 model, text, folder_centroids
@@ -233,7 +301,8 @@ def run(
             decision = "REVIEW"
             if best_score >= AUTO_THRESHOLD and margin >= MARGIN_THRESHOLD:
                 decision = "AUTO_SUGGEST"
-
+            
+            # TODO: Change to use SortRecord
             record = {
                 "type": "folder",
                 "path": str(folder),
@@ -244,7 +313,6 @@ def run(
                 "sampled_files": sampled,
                 "top5": top5,
             }
-            logf.write(json.dumps(record, ensure_ascii=False) + "\n")
 
             # mark contained files as covered so we don't also propose them individually
             for fp in iter_files_in_folder(folder):
@@ -269,6 +337,7 @@ def run(
             if best_score >= AUTO_THRESHOLD and margin >= MARGIN_THRESHOLD:
                 decision = "AUTO_SUGGEST"
 
+            # TODO: Change to use SortRecord
             record = {
                 "type": "zip",
                 "path": str(zp),
@@ -291,9 +360,12 @@ def run(
             if str(fp) in covered_files:
                 continue
 
-            text = process_file_content(fp)
-            if not text.strip():
-                text = file_to_text(fp)
+            raw_text = process_file_content(fp)
+            if not raw_text.strip():
+                raw_text = file_to_text(fp)
+
+            fmt = detect_format_for_path(fp)  # NEW
+            text = inject_format_hint(raw_text, fmt["format"])
 
             best_folder, best_score, second_score, margin, top5 = propose_destination(
                 model, text, folder_centroids
@@ -303,6 +375,7 @@ def run(
             if best_score >= AUTO_THRESHOLD and margin >= MARGIN_THRESHOLD:
                 decision = "AUTO_SUGGEST"
 
+            # TODO: Change to use SortRecord
             record = {
                 "type": "file",
                 "path": str(fp),
@@ -310,6 +383,7 @@ def run(
                 "best_score": best_score,
                 "margin": margin,
                 "decision": decision,
+                "format": fmt, 
                 "top5": top5,
             }
             logf.write(json.dumps(record, ensure_ascii=False) + "\n")
