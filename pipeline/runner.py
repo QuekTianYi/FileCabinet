@@ -4,6 +4,7 @@ from pathlib import Path
 from time import time
 import numpy as np
 from sentence_transformers import SentenceTransformer
+from handlers.base import ExtractResult
 from handlers.doc_handler import DocHandler
 from handlers.folder_handler import FolderHandler
 from handlers.utils import MAX_FILES_PER_CONTAINER, MAX_TEXT_CHARS_PER_ITEM, MAX_TOTAL_TEXT_CHARS, ZIP_EXTS
@@ -14,6 +15,7 @@ import uuid
 from pipeline.file_format import FileFormat
 from pipeline.format import detect_file_format
 from pipeline.record import SortRecord
+from pipeline.work_item import WorkItem
 
 # -----------------------------
 # Globals / setup
@@ -90,91 +92,12 @@ def iter_files_in_folder(folder: Path):
             continue
         if fp.is_file():
             yield fp
-
-def aggregate_folder_text(folder: Path) -> tuple[str, list[str]]:
-    """
-    Build a single text blob representing the folder based on:
-    - folder name
-    - content of files inside (sampled)
-    Returns: (text, sampled_file_paths)
-    """
-    pieces = [f"folder_name: {folder.name.replace('_',' ').replace('-',' ')}"]
-    sampled = []
-    total_chars = 0
-    taken = 0
-
-    for fp in iter_files_in_folder(folder):
-        # Stop if we already sampled enough
-        if taken >= MAX_FILES_PER_CONTAINER or total_chars >= MAX_TOTAL_TEXT_CHARS:
-            break
-
-        text = process_file_content(fp)
-        if not text.strip():
-            # even if we can't extract content, filename is still helpful
-            text = file_to_text(fp)
-
-        # add a small header so names don't blur together
-        chunk = f" file: {fp.name} content: {text}"
-        pieces.append(chunk)
-        sampled.append(str(fp))
-
-        total_chars += len(chunk)
-        taken += 1
-
-    agg = " | ".join(pieces)
-    return agg[:MAX_TOTAL_TEXT_CHARS], sampled
-
-def aggregate_zip_text(zip_path: Path) -> tuple[str, list[str]]:
-    """
-    Build a single text blob representing the zip based on:
-    - zip filename
-    - names of files inside
-    - (optional) extracted text from text-like files inside zip (sampled)
-    Returns: (text, sampled_inner_names)
-    """
-    pieces = [f"zip_name: {zip_path.stem.replace('_',' ').replace('-',' ')}"]
-    sampled = []
-    total_chars = 0
-    taken = 0
-
-    try:
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            # list members (skip directories)
-            members = [m for m in zf.namelist() if not m.endswith("/")]
-            # light ordering heuristic: smaller names first (often more relevant),
-            # but keep it simple
-            for m in members:
-                if taken >= MAX_FILES_PER_CONTAINER or total_chars >= MAX_TOTAL_TEXT_CHARS:
-                    break
-
-                # always include inner filename
-                inner_name = Path(m).name
-                chunk_parts = [f" inner_file: {inner_name}"]
-
-                # Optionally extract content from obviously text-like files inside zip
-                ext = Path(m).suffix.lower()
-                if ext in {".txt", ".md", ".csv", ".log"}:
-                    try:
-                        raw = zf.read(m)
-                        txt = raw.decode("utf-8", errors="ignore")[:MAX_TEXT_CHARS_PER_ITEM]
-                        if txt.strip():
-                            chunk_parts.append(f" content: {txt}")
-                    except Exception:
-                        pass
-
-                chunk = " ".join(chunk_parts)
-                pieces.append(chunk)
-                sampled.append(m)
-
-                total_chars += len(chunk)
-                taken += 1
-
-    except Exception:
-        # If zip is invalid or unreadable, fallback to name only
-        return f"zip_name: {zip_path.stem}", []
-
-    agg = " | ".join(pieces)
-    return agg[:MAX_TOTAL_TEXT_CHARS], sampled
+            
+def extract_text_result(path: Path) -> ExtractResult:
+    for h in handlers:
+        if h.can_handle(path):
+            return h.extract(path)  # MUST return ExtractResult(text, sampled)
+    return ExtractResult(text="", sampled=[])
 
 def detect_format_for_path(path: Path):
     """
@@ -236,6 +159,134 @@ def inject_format_hint(text: str, fmt_name: str) -> str:
     """
     return f"format: {fmt_name}. {text}"
 
+def decide(best_score: float, margin: float, auto_th: float, margin_th: float) -> str:
+    return "AUTO_SUGGEST" if (best_score >= auto_th and margin >= margin_th) else "REVIEW"
+
+def prepare_text(raw_text: str, fallback: str, fmt: dict) -> str:
+    """
+    - ensure non-empty text
+    - inject format hint
+    """
+    if not (raw_text or "").strip():
+        raw_text = fallback
+    return inject_format_hint(raw_text, fmt.get("format", "UNKNOWN"))
+
+def propose_item(
+    *,
+    item_type: str,
+    path: Path,
+    raw_text: str,
+    fallback_text: str,
+    folder_centroids: dict,
+    auto_th: float,
+    margin_th: float,
+    extra_record_fields: dict | None = None,
+):
+    """
+    Returns: record_dict, best_folder (for printing)
+    """
+    fmt = detect_format_for_path(path)
+    text = prepare_text(raw_text, fallback_text, fmt)
+
+    best_folder, best_score, second_score, margin, top5 = propose_destination(
+        model, text, folder_centroids
+    )
+
+    decision_str = decide(best_score, margin, auto_th, margin_th)
+
+    record = {
+        "type": item_type,
+        "path": str(path),
+        "propose_move_to_category": best_folder,
+        "best_score": best_score,
+        "margin": margin,
+        "decision": decision_str,
+        "top5": top5,
+        # keep format info consistent everywhere (optional but recommended)
+        "format": fmt,
+    }
+
+    if extra_record_fields:
+        record.update(extra_record_fields)
+
+    return record, best_folder, decision_str
+
+def process_work_item(
+    wi: WorkItem,
+    *,
+    folder_centroids: dict,
+    auto_th: float,
+    margin_th: float,
+):
+    raw_text = wi.raw_text_fn()
+    fallback = wi.fallback_text_fn()
+    extra = wi.extra_fields_fn()
+
+    record, best_folder, decision = propose_item(
+        item_type=wi.item_type,
+        path=wi.path,
+        raw_text=raw_text,
+        fallback_text=fallback,
+        folder_centroids=folder_centroids,
+        auto_th=auto_th,
+        margin_th=margin_th,
+        extra_record_fields=extra,
+    )
+    covered = wi.covered_paths_fn()
+    return record, best_folder, covered
+
+def build_work_items(
+    WATCH_DIR: Path,
+    top_level_folders: list[Path],
+    zips: list[Path],
+    loose_files: list[Path],
+):
+    items: list[WorkItem] = []
+
+    # folders
+    for folder in sorted(top_level_folders):
+        res = extract_text_result(folder)
+        items.append(
+            WorkItem(
+                item_type="folder",
+                path=folder,
+                raw_text_fn=lambda r=res: r.text,
+                fallback_text_fn=lambda f=folder: f"folder_name: {f.name}",
+                extra_fields_fn=lambda r=res: {"sampled_files": r.sampled},
+                covered_paths_fn=lambda f=folder: [str(fp) for fp in iter_files_in_folder(f)],
+            )
+        )
+
+    # zips
+    for zp in sorted(zips):
+        res = extract_text_result(zp)
+        items.append(
+            WorkItem(
+                item_type="zip",
+                path=zp,
+                raw_text_fn=lambda r=res: r.text,
+                fallback_text_fn=lambda z=zp: f"zip_name: {z.stem}",
+                extra_fields_fn=lambda r=res: {"sampled_inner_files": r.sampled},
+                covered_paths_fn=lambda: [],
+            )
+        )
+
+    # files
+    for fp in sorted(loose_files):
+        res = extract_text_result(fp)
+        items.append(
+            WorkItem(
+                item_type="file",
+                path=fp,
+                raw_text_fn=lambda r=res: r.text,
+                fallback_text_fn=lambda p=fp: file_to_text(p),
+                extra_fields_fn=lambda: {},
+                covered_paths_fn=lambda: [],
+            )
+        )
+
+    return items
+
 # -----------------------------
 # Main runner
 # -----------------------------
@@ -275,122 +326,37 @@ def run(
 
     run_id = uuid.uuid4().hex[:10] # short run id like "a1b2c3d4e5"
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    with LOG_PATH.open("w", encoding="utf-8") as logf:
+    items = build_work_items(WATCH_DIR, top_level_folders, zips, loose_files)
 
-        header = {
+    covered_files = set()
+
+    with LOG_PATH.open("w", encoding="utf-8") as logf:
+        logf.write(json.dumps({
             "type": "run_header",
             "run_id": run_id,
             "started_at_utc": started_at,
             "watch_dir": str(WATCH_DIR),
-        }
-        logf.write(json.dumps(header, ensure_ascii=False) + "\n")
+        }, ensure_ascii=False) + "\n")
 
-        # ---- Folder proposals (TOP-LEVEL only; move whole folder)
-        for folder in sorted(top_level_folders):
-            raw_text, sampled = aggregate_folder_text(folder)
-            if not raw_text.strip():
-                raw_text = f"folder_name: {folder.name}"
+        for wi in items:
+            # skip file if already covered by a folder item
+            if wi.item_type == "file" and str(wi.path) in covered_files:
+                continue
 
-            fmt = detect_format_for_path(folder)  # FOLDER
-            text = inject_format_hint(raw_text, fmt["format"])
-
-            best_folder, best_score, second_score, margin, top5 = propose_destination(
-                model, text, folder_centroids
+            record, best_folder, newly_covered = process_work_item(
+                wi,
+                folder_centroids=folder_centroids,
+                auto_th=AUTO_THRESHOLD,
+                margin_th=MARGIN_THRESHOLD,
             )
-
-            decision = "REVIEW"
-            if best_score >= AUTO_THRESHOLD and margin >= MARGIN_THRESHOLD:
-                decision = "AUTO_SUGGEST"
-            
-            # TODO: Change to use SortRecord
-            record = {
-                "type": "folder",
-                "path": str(folder),
-                "propose_move_to_category": best_folder,
-                "best_score": best_score,
-                "margin": margin,
-                "decision": decision,
-                "sampled_files": sampled,
-                "top5": top5,
-            }
-
-            # mark contained files as covered so we don't also propose them individually
-            for fp in iter_files_in_folder(folder):
-                covered_files.add(str(fp))
-
-            count += 1
-            if count % 10 == 0:
-                elapsed = time() - start_time
-                print(f"[{count}] items processed ({elapsed:.1f}s) latest folder: {folder.name} -> {best_folder}")
-
-        # ---- Zip proposals (move whole zip) - top-level zips
-        for zp in sorted(zips):
-            text, sampled_inner = aggregate_zip_text(zp)
-            if not text.strip():
-                text = f"zip_name: {zp.stem}"
-
-            best_folder, best_score, second_score, margin, top5 = propose_destination(
-                model, text, folder_centroids
-            )
-
-            decision = "REVIEW"
-            if best_score >= AUTO_THRESHOLD and margin >= MARGIN_THRESHOLD:
-                decision = "AUTO_SUGGEST"
-
-            # TODO: Change to use SortRecord
-            record = {
-                "type": "zip",
-                "path": str(zp),
-                "propose_move_to_category": best_folder,
-                "best_score": best_score,
-                "margin": margin,
-                "decision": decision,
-                "sampled_inner_files": sampled_inner,
-                "top5": top5,
-            }
             logf.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            for c in newly_covered:
+                covered_files.add(c)
 
             count += 1
             if count % 25 == 0:
                 elapsed = time() - start_time
-                print(f"[{count}] items processed ({elapsed:.1f}s) latest zip: {zp.name} -> {best_folder}")
+                print(f"[{count}] items processed ({elapsed:.1f}s) latest: {wi.path.name} -> {record['propose_move_to_category']}")
 
-        # ---- File proposals (move file) - only for top-level loose files (not covered)
-        for fp in sorted(loose_files):
-            if str(fp) in covered_files:
-                continue
-
-            raw_text = process_file_content(fp)
-            if not raw_text.strip():
-                raw_text = file_to_text(fp)
-
-            fmt = detect_format_for_path(fp)  # NEW
-            text = inject_format_hint(raw_text, fmt["format"])
-
-            best_folder, best_score, second_score, margin, top5 = propose_destination(
-                model, text, folder_centroids
-            )
-
-            decision = "REVIEW"
-            if best_score >= AUTO_THRESHOLD and margin >= MARGIN_THRESHOLD:
-                decision = "AUTO_SUGGEST"
-
-            # TODO: Change to use SortRecord
-            record = {
-                "type": "file",
-                "path": str(fp),
-                "propose_move_to_category": best_folder,
-                "best_score": best_score,
-                "margin": margin,
-                "decision": decision,
-                "format": fmt, 
-                "top5": top5,
-            }
-            logf.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-            count += 1
-            if count % 50 == 0:
-                elapsed = time() - start_time
-                print(f"[{count}] items processed ({elapsed:.1f}s) latest file: {fp.name} -> {best_folder}")
-
-    print(f"Done. {count} item(s) processed.")
+    print(f"Done. {count} item(s) processed. run_id={run_id}")
